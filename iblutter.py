@@ -270,6 +270,7 @@ def run_blutter(elf_path, output_dir, dart_version, verbose=False):
     err_count = 0
     cur_lib = ""
     lib_fn_count = 0
+    exception_lines = []
 
     proc = subprocess.Popen(
         [exe_path, "-i", elf_path, "-o", output_dir],
@@ -306,6 +307,13 @@ def run_blutter(elf_path, output_dir, dart_version, verbose=False):
             lib_fn_count = 0
             continue
 
+        # Capture Blutter internal exceptions (these indicate a fatal internal failure
+        # even when the process exits with code 0)
+        if line_stripped.lower().startswith("exception:"):
+            exception_lines.append(line_stripped)
+            print(f"  [!] {line_stripped}")
+            continue
+
         print(line_stripped)
 
     if cur_lib and lib_fn_count > 0:
@@ -319,8 +327,29 @@ def run_blutter(elf_path, output_dir, dart_version, verbose=False):
     if proc.returncode != 0:
         print(f"\n[-] Blutter exited with code {proc.returncode}")
         sys.exit(proc.returncode)
-    else:
-        print(f"[+] Blutter completed successfully!")
+
+    # Validate that Blutter actually wrote output — it can exit 0 but produce nothing
+    # when an internal exception occurs (e.g. "exception: getting native function pool
+    # object from Dart code").
+    output_sentinels = ["asm", "pp.txt", "blutter_frida.js", "objs.txt", "ida_script"]
+    produced = [s for s in output_sentinels if os.path.exists(os.path.join(output_dir, s))]
+
+    if not produced:
+        print(f"\n[-] Blutter produced no output files in: {output_dir}")
+        if exception_lines:
+            print(f"    Blutter threw internal exception(s):")
+            for exc in exception_lines:
+                print(f"      {exc}")
+        print()
+        print(f"  Possible causes & fixes:")
+        print(f"  1. Wrong Dart version  -- retry with --dart-version <ver>")
+        print(f"     Available: check bin/ for compiled blutter binaries")
+        print(f"  2. Corrupt / unsupported snapshot -- try --verbose to see full Blutter output")
+        print(f"  3. Dart 3.x native pool exception -- this app may need a patched Blutter build")
+        print(f"     See: https://github.com/worawit/blutter/issues")
+        sys.exit(1)
+
+    print(f"[+] Blutter completed successfully!")
 
 
 def print_results(output_dir):
@@ -374,6 +403,8 @@ Examples:
     os.makedirs(output_dir, exist_ok=True)
 
     tmpdir = None
+    elf_path = None
+    keep_elf = args.keep_elf
 
     try:
         flutter_binary = None
@@ -404,17 +435,18 @@ Examples:
         # Step 4: Extract and display snapshot hash
         extract_snapshot_hash(elf_path)
 
-        # Step 5: Run Blutter
+        # Step 5: Run Blutter (exits via sys.exit on failure, finally block still runs)
         run_blutter(elf_path, output_dir, dart_version, verbose=args.verbose)
-
-        # Step 6: Cleanup
-        if not args.keep_elf and os.path.exists(elf_path):
-            os.remove(elf_path)
-            print(f"[*] Removed intermediate ELF (use --keep-elf to keep it)")
 
         print_results(output_dir)
 
     finally:
+        # Clean up intermediate ELF unless --keep-elf was requested.
+        # Runs even when run_blutter calls sys.exit() on failure so we never
+        # leave a stale libapp.so behind in the output folder.
+        if elf_path and os.path.exists(elf_path) and not keep_elf:
+            os.remove(elf_path)
+            print(f"[*] Removed intermediate ELF (use --keep-elf to keep it)")
         if tmpdir and os.path.exists(tmpdir):
             shutil.rmtree(tmpdir, ignore_errors=True)
 
