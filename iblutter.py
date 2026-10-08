@@ -22,6 +22,13 @@ import zipfile
 import tempfile
 import re
 
+if hasattr(sys.stdout, 'reconfigure'):
+    try:
+        sys.stdout.reconfigure(encoding='utf-8')
+        sys.stderr.reconfigure(encoding='utf-8')
+    except Exception:
+        pass
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 BIN_DIR = os.path.join(SCRIPT_DIR, "bin")
 SCRIPTS_DIR = os.path.join(SCRIPT_DIR, "scripts")
@@ -42,8 +49,8 @@ def banner():
  | || |_) | | |_| | |_| ||  __/ |    
  |_||____/ |_|\__,_|\__|\__\___|_|   
                                       
-  iBlutter - iOS Flutter RE Tool       
-  ------------------------------------
+  iBlutter - iOS Flutter Reverse Engineering Tool
+  -----------------------------------------------
 """)
 
 
@@ -191,8 +198,98 @@ def convert_macho_to_elf(binary_path, output_elf_path):
     print(f"[+] ELF written to: {output_elf_path}")
 
 
-def get_blutter_executable(dart_version):
-    """Locate the appropriate Blutter executable for the given Dart version."""
+def find_vs_dev_cmd():
+    """Find VsDevCmd.bat path using vswhere or standard locations."""
+    vswhere = os.path.expandvars(r"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe")
+    if os.path.exists(vswhere):
+        try:
+            out = subprocess.run([vswhere, "-latest", "-property", "installationPath"],
+                                 capture_output=True, text=True, check=True).stdout.strip()
+            if out:
+                cmd_path = os.path.join(out, "Common7", "Tools", "VsDevCmd.bat")
+                if os.path.exists(cmd_path):
+                    return cmd_path
+        except Exception:
+            pass
+    fallback = r"C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\Tools\VsDevCmd.bat"
+    if os.path.exists(fallback):
+        return fallback
+    return None
+
+
+def auto_build_blutter(dart_version, snapshot_hash=None):
+    """Automatically fetch Dart SDK, apply patches, and compile the missing Blutter binary."""
+    blutter_dir = os.path.join(os.path.dirname(SCRIPT_DIR), "Blutter", "blutter")
+    if not os.path.exists(blutter_dir):
+        return None
+
+    vs_dev_cmd = find_vs_dev_cmd()
+    if not vs_dev_cmd:
+        print("[-] Visual Studio developer tools not found. Cannot auto-build Blutter binary.")
+        return None
+
+    print(f"\n[*] [Auto-Build] No binary found for Dart {dart_version}.")
+    print(f"[*] [Auto-Build] Fetching Dart SDK {dart_version} and compiling Blutter binary...")
+    print(f"    Workspace : {blutter_dir}")
+    print(f"    Target    : ios arm64 (no-compressed-ptrs)")
+    if snapshot_hash:
+        print(f"    Snapshot  : {snapshot_hash}")
+    print(f"    Please wait (this one-time compilation takes ~1-2 minutes)...")
+
+    # Command 1: Fetch & build Dart SDK runtime library
+    cmd_sdk = f'"{vs_dev_cmd}" -arch=x64 -host_arch=x64 && python dartvm_fetch_build.py {dart_version} ios arm64'
+    if snapshot_hash:
+        cmd_sdk += f' {snapshot_hash}'
+
+    try:
+        res = subprocess.run(f'cmd /c "{cmd_sdk}"', cwd=blutter_dir, shell=True, capture_output=True, text=True)
+        if res.returncode != 0:
+            print(f"[-] [Auto-Build] Dart SDK build failed:")
+            print(res.stderr[-1000:] if res.stderr else res.stdout[-1000:])
+            return None
+    except Exception as e:
+        print(f"[-] [Auto-Build] Error building Dart SDK: {e}")
+        return None
+
+    # Command 2: Build Blutter binary
+    py_code = (
+        f"from blutter import BlutterInput, cmake_blutter; "
+        f"from dartvm_fetch_build import DartLibInfo; "
+        f"dart_info = DartLibInfo('{dart_version}', 'ios', 'arm64', has_compressed_ptrs=False, snapshot_hash='{snapshot_hash or ''}'); "
+        f"input_obj = BlutterInput('', dart_info, '', False, False, False); "
+        f"cmake_blutter(input_obj)"
+    )
+    cmd_blutter = f'"{vs_dev_cmd}" -arch=x64 -host_arch=x64 && python -c "{py_code}"'
+
+    try:
+        res = subprocess.run(f'cmd /c "{cmd_blutter}"', cwd=blutter_dir, shell=True, capture_output=True, text=True)
+        if res.returncode != 0:
+            print(f"[-] [Auto-Build] Blutter executable compilation failed:")
+            print(res.stderr[-1000:] if res.stderr else res.stdout[-1000:])
+            return None
+    except Exception as e:
+        print(f"[-] [Auto-Build] Error compiling Blutter executable: {e}")
+        return None
+
+    expected_name = f"blutter_dartvm{dart_version}_ios_arm64_no-compressed-ptrs.exe"
+    built_path = os.path.join(blutter_dir, "bin", expected_name)
+    if os.path.exists(built_path):
+        os.makedirs(BIN_DIR, exist_ok=True)
+        local_path = os.path.join(BIN_DIR, expected_name)
+        shutil.copy(built_path, local_path)
+        for dll in ["capstone.dll", "icudt73.dll", "icuuc73.dll"]:
+            src_dll = os.path.join(blutter_dir, "bin", dll)
+            dst_dll = os.path.join(BIN_DIR, dll)
+            if os.path.exists(src_dll) and not os.path.exists(dst_dll):
+                shutil.copy(src_dll, dst_dll)
+        print(f"[+] [Auto-Build] Successfully built and cached: {expected_name}\n")
+        return local_path
+
+    return None
+
+
+def get_blutter_executable(dart_version, snapshot_hash=None):
+    """Locate or auto-build the appropriate Blutter executable for the given Dart version."""
     expected_name = f"blutter_dartvm{dart_version}_ios_arm64_no-compressed-ptrs.exe"
     
     # 1. Check local BIN_DIR
@@ -214,7 +311,12 @@ def get_blutter_executable(dart_version):
                     shutil.copy(src_dll, dst_dll)
             return local_path
 
-    # 3. List all available binaries for user feedback
+    # 3. Attempt automated on-demand build
+    auto_path = auto_build_blutter(dart_version, snapshot_hash)
+    if auto_path and os.path.exists(auto_path):
+        return auto_path
+
+    # 4. List all available binaries for user feedback
     available = []
     if os.path.exists(BIN_DIR):
         for f in os.listdir(BIN_DIR):
@@ -233,44 +335,29 @@ def get_blutter_executable(dart_version):
     )
 
 
-def run_blutter(elf_path, output_dir, dart_version, verbose=False):
+def run_blutter(elf_path, output_dir, dart_version, snapshot_hash=None, verbose=False):
     """Run the Blutter binary on the converted ELF with clean filtered output."""
-    exe_path = get_blutter_executable(dart_version)
+    exe_path = get_blutter_executable(dart_version, snapshot_hash=snapshot_hash)
 
-    print(f"[*] Running Blutter ({dart_version})...")
+    print(f"[*] Initializing Dart {dart_version} decompiler...")
     print(f"    Binary : {exe_path}")
-    print(f"    Input  : {elf_path}")
     print(f"    Output : {output_dir}")
     print()
 
-    IMPORTANT_PREFIXES = (
-        "Dumping Object Pool",
-        "Dumping Objects",
-        "Generating application",
-        "Dumping 4Ida",
-        "Generating Frida",
-        "AnalyzeAll: iteration",
-        "AnalyzeAll: lib",
-        "main:",
-    )
-    SUPPRESS_PREFIXES = (
-        "  Analyzing function:",
-        "Analysis error at line",
-        "    0x",
-        "  * 0x",
-        "  DumpStructHeaderFile",
-        "  Dump4Ida",
-        "  Written ELF",
-        "  .text:",
-        "  .rodata:",
-        "  _kDart",
-    )
+    MILESTONES = [
+        ("Analyzing the application", "[*] Analyzing Dart application functions..."),
+        ("Dumping Object Pool", "[*] Dumping Dart Object Pool (pp.txt)..."),
+        ("Dumping Objects", "[*] Dumping Dart Objects (objs.txt)..."),
+        ("Generating application assemblies", "[*] Generating decompiled class structure (asm/)..."),
+        ("Generating application functions in asm folder", "[*] Generating decompiled class structure (asm/)..."),
+        ("Dumping 4Ida", "[*] Generating IDA Pro & Ghidra labeling scripts..."),
+        ("Generating Frida script", "[*] Generating Frida instrumentation script (blutter_frida.js)..."),
+    ]
 
     fn_count = 0
     err_count = 0
-    cur_lib = ""
-    lib_fn_count = 0
     exception_lines = []
+    seen_milestones = set()
 
     proc = subprocess.Popen(
         [exe_path, "-i", elf_path, "-o", output_dir],
@@ -287,42 +374,42 @@ def run_blutter(elf_path, output_dir, dart_version, verbose=False):
             print(line_stripped)
             continue
 
-        if line_stripped.startswith("Analysis error at line"):
+        if "Analysis error at line" in line_stripped:
             err_count += 1
             continue
 
-        if line_stripped.startswith("  Analyzing function:"):
+        if "Analyzing function:" in line_stripped or "AnalyzeAll: lib" in line_stripped:
             fn_count += 1
-            lib_fn_count += 1
+            if fn_count % 1000 == 0:
+                print(f"\r[*] Analyzing Dart functions: {fn_count:,} functions processed...", end="", flush=True)
             continue
 
-        if any(line_stripped.startswith(p) for p in SUPPRESS_PREFIXES):
+        # Check for milestone headers
+        matched_milestone = False
+        for tag, msg in MILESTONES:
+            if tag in line_stripped and tag not in seen_milestones:
+                seen_milestones.add(tag)
+                if fn_count > 0:
+                    print()  # newline after live counter
+                print(msg)
+                matched_milestone = True
+                break
+
+        if matched_milestone:
             continue
 
-        if line_stripped.startswith("AnalyzeAll: lib"):
-            lib_name = line_stripped.replace("AnalyzeAll: lib", "").strip()
-            if cur_lib and lib_fn_count > 0:
-                print(f"    [{lib_fn_count:>5} functions]  {cur_lib}")
-            cur_lib = lib_name if lib_name else "(core)"
-            lib_fn_count = 0
-            continue
-
-        # Capture Blutter internal exceptions (these indicate a fatal internal failure
-        # even when the process exits with code 0)
+        # Capture Blutter internal exceptions
         if line_stripped.lower().startswith("exception:"):
             exception_lines.append(line_stripped)
             print(f"  [!] {line_stripped}")
             continue
 
-        print(line_stripped)
-
-    if cur_lib and lib_fn_count > 0:
-        print(f"    [{lib_fn_count:>5} functions]  {cur_lib}")
-
     proc.wait()
 
-    print()
-    print(f"[*] Analysis summary: {fn_count} functions processed, {err_count} non-critical analysis warnings")
+    if fn_count > 0 and not verbose:
+        print()  # ensure final newline
+
+    print(f"[*] Analysis summary: {fn_count:,} Dart functions processed, {err_count} non-critical warnings")
 
     if proc.returncode != 0:
         print(f"\n[-] Blutter exited with code {proc.returncode}")
@@ -433,10 +520,10 @@ Examples:
         convert_macho_to_elf(binary_path, elf_path)
 
         # Step 4: Extract and display snapshot hash
-        extract_snapshot_hash(elf_path)
+        snapshot_hash = extract_snapshot_hash(elf_path)
 
         # Step 5: Run Blutter (exits via sys.exit on failure, finally block still runs)
-        run_blutter(elf_path, output_dir, dart_version, verbose=args.verbose)
+        run_blutter(elf_path, output_dir, dart_version, snapshot_hash=snapshot_hash, verbose=args.verbose)
 
         print_results(output_dir)
 
